@@ -79,8 +79,15 @@ from mcp import McpError
 # Config & Paths
 # ----------------------------------------------------------------------------
 
-mcp = FastMCP("medlabs")
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+server_instructions = """
+This MCP server provides medical lab data ingestion, normalization, and analysis capabilities.
+Use the tools to ingest lab reports from various formats (CSV, PDF, images), normalize data
+into a canonical schema, store in SQLite database, and generate longitudinal analysis reports
+with time-series plots and summaries.
+"""
 
 ROOT = Path(os.getenv("MEDLABS_ROOT", ".")).resolve()
 DATA_DIR = ROOT / "data"
@@ -335,6 +342,12 @@ def parse_csv(path: Path) -> list[pd.DataFrame]:
     return [df]
 
 
+def parse_csv_text(csv_content: str) -> list[pd.DataFrame]:
+    """Parse CSV content from a string."""
+    df = pd.read_csv(io.StringIO(csv_content))
+    return [df]
+
+
 def parse_pdf(path: Path) -> list[pd.DataFrame]:
     if pdfplumber is None:
         raise McpError("pdfplumber is not installed. Please `uv add pdfplumber`. ")
@@ -391,94 +404,8 @@ def parse_image(path: Path) -> list[pd.DataFrame]:
 
 
 # ----------------------------------------------------------------------------
-# Tools
+# Utility functions for tools
 # ----------------------------------------------------------------------------
-
-@mcp.tool()
-async def ingest_file(path: str, subject_id: Optional[str] = None, hadm_id: Optional[str] = None, file_type: Optional[str] = None) -> dict:
-    """Ingest a medical lab report (CSV, PDF, JPG/PNG) and normalize it into the local store.
-
-    Args:
-        path: Absolute or relative path to the file on disk
-        subject_id: Optional subject/patient id to attach when missing
-        hadm_id: Optional admission id
-        file_type: Optional explicit type override: csv|pdf|image
-
-    Returns: {"rows_added": int, "frames_parsed": int, "preview": list[dict]} (first 5 normalized rows)
-    """
-    p = Path(path).expanduser().resolve()
-    if not p.exists():
-        raise McpError(f"File not found: {p}")
-
-    kind = (file_type or p.suffix.lower().lstrip(".")).lower()
-    if kind in ("csv", "tsv"):
-        frames = parse_csv(p)
-    elif kind in ("pdf",):
-        frames = parse_pdf(p)
-    elif kind in ("jpg", "jpeg", "png", "tiff"):
-        frames = parse_image(p)
-    else:
-        raise McpError(f"Unsupported file type: {kind}")
-
-    total_added = 0
-    normalized_frames: list[pd.DataFrame] = []
-
-    for idx, fr in enumerate(frames, start=1):
-        if fr is None or fr.empty:
-            continue
-        norm = normalize_dataframe(fr, subject_id=subject_id, source_path=str(p), source_page=idx if kind == "pdf" else None)
-        # Add hadm_id if provided
-        if hadm_id is not None:
-            norm["hadm_id"] = hadm_id
-        added = _insert_rows(norm)
-        total_added += added
-        normalized_frames.append(norm)
-
-    preview = []
-    if normalized_frames:
-        sample = pd.concat(normalized_frames, ignore_index=True).head(5)
-        preview = sample.fillna("").to_dict(orient="records")
-
-    return {"rows_added": int(total_added), "frames_parsed": len(frames), "preview": preview}
-
-
-@mcp.tool()
-async def list_subjects(limit: int = 100) -> list[str]:
-    """List known subjects/patient identifiers present in the local store."""
-    with _connect() as con:
-        cur = con.execute("SELECT DISTINCT subject_id FROM labs WHERE subject_id IS NOT NULL LIMIT ?", (limit,))
-        return [r[0] for r in cur.fetchall() if r[0] is not None]
-
-
-@mcp.tool()
-async def lab_trends(subject_id: str, label_filter: Optional[str] = None, days: Optional[int] = None) -> dict:
-    """Return longitudinal lab values for a subject (optionally filtered by label and lookback days).
-
-    Returns JSON: {label: [{charttime, valuenum, ref_low, ref_high, valueuom}], ...}
-    """
-    params: list[Any] = [subject_id]
-    where = "WHERE subject_id = ? AND valuenum IS NOT NULL"
-    if label_filter:
-        where += " AND label LIKE ?"
-        params.append(f"%{label_filter}%")
-    if days:
-        where += " AND julianday('now') - julianday(charttime) <= ?"
-        params.append(days)
-    sql = f"SELECT label, charttime, valuenum, ref_low, ref_high, valueuom FROM labs {where} ORDER BY label, charttime"
-    with _connect() as con:
-        cur = con.execute(sql, params)
-        rows = cur.fetchall()
-    result: dict[str, list[dict[str, Any]]] = {}
-    for label, charttime, valuenum, rl, rh, uom in rows:
-        result.setdefault(label or "(unknown)", []).append({
-            "charttime": charttime,
-            "valuenum": valuenum,
-            "ref_low": rl,
-            "ref_high": rh,
-            "valueuom": uom,
-        })
-    return result
-
 
 def _distance_to_mid(val: float, low: Optional[float], high: Optional[float]) -> Optional[float]:
     if val is None or low is None or high is None or low >= high:
@@ -504,231 +431,393 @@ def _trend_score(times: list[datetime], values: list[float]) -> Optional[float]:
         return None
 
 
-@mcp.tool()
-async def running_summary(subject_id: str, top_k: int = 10, min_points: int = 3) -> dict:
-    """Summarize improvement/decline across all labs for a subject.
+# ----------------------------------------------------------------------------
+# Server creation and entrypoint
+# ----------------------------------------------------------------------------
 
-    Method:
-      - compute normalized distance to reference midpoint per observation
-      - compare early vs late windows + slope per label
-    Returns dict with improvements, declines, still_abnormal, overview stats.
-    """
-    with _connect() as con:
-        cur = con.execute(
-            """
-            SELECT label, charttime, valuenum, ref_low, ref_high, valueuom
-            FROM labs
-            WHERE subject_id = ? AND valuenum IS NOT NULL
-            ORDER BY label, charttime
-            """,
-            (subject_id,),
-        )
-        rows = cur.fetchall()
+def create_server():
+    """Create and configure the MCP server with medical lab tools."""
+    # Initialize the FastMCP server
+    mcp = FastMCP(
+        name="MedLabs MCP Server",
+        instructions=server_instructions,
+        host="0.0.0.0",
+        port=8000
+    )
 
-    # Group by label
-    by_label: dict[str, list[tuple[datetime, float, Optional[float], Optional[float], str]]] = {}
-    for label, charttime, valuenum, rl, rh, uom in rows:
+    # Register all the tools
+    @mcp.tool()
+    async def ingest_csv_data(csv_content: str, subject_id: Optional[str] = None, hadm_id: Optional[str] = None) -> dict:
+        """Ingest CSV lab report data from text content and normalize it into the local store.
+
+        Args:
+            csv_content: CSV data as a text string
+            subject_id: Optional subject/patient id to attach when missing
+            hadm_id: Optional admission id
+
+        Returns: {"rows_added": int, "frames_parsed": int, "preview": list[dict]} (first 5 normalized rows)
+        """
+        if not csv_content or not csv_content.strip():
+            raise McpError("CSV content cannot be empty")
+
         try:
-            dt = pd.to_datetime(charttime).to_pydatetime()
+            frames = parse_csv_text(csv_content)
+        except Exception as e:
+            raise McpError(f"Failed to parse CSV content: {str(e)}")
+
+        total_added = 0
+        normalized_frames: list[pd.DataFrame] = []
+
+        for idx, fr in enumerate(frames, start=1):
+            if fr is None or fr.empty:
+                continue
+            norm = normalize_dataframe(fr, subject_id=subject_id, source_path="csv_text_input", source_page=None)
+            # Add hadm_id if provided
+            if hadm_id is not None:
+                norm["hadm_id"] = hadm_id
+            added = _insert_rows(norm)
+            total_added += added
+            normalized_frames.append(norm)
+
+        preview = []
+        if normalized_frames:
+            sample = pd.concat(normalized_frames, ignore_index=True).head(5)
+            preview = sample.fillna("").to_dict(orient="records")
+
+        return {"rows_added": int(total_added), "frames_parsed": len(frames), "preview": preview}
+
+    @mcp.tool()
+    async def ingest_file(path: str, subject_id: Optional[str] = None, hadm_id: Optional[str] = None, file_type: Optional[str] = None) -> dict:
+        """Ingest a medical lab report file (PDF, JPG/PNG) and normalize it into the local store.
+
+        Args:
+            path: Absolute or relative path to the file on disk
+            subject_id: Optional subject/patient id to attach when missing
+            hadm_id: Optional admission id
+            file_type: Optional explicit type override: pdf|image
+
+        Returns: {"rows_added": int, "frames_parsed": int, "preview": list[dict]} (first 5 normalized rows)
+        """
+        p = Path(path).expanduser().resolve()
+        if not p.exists():
+            raise McpError(f"File not found: {p}")
+
+        kind = (file_type or p.suffix.lower().lstrip(".")).lower()
+        if kind in ("csv", "tsv"):
+            raise McpError("For CSV data, use ingest_csv_data tool with text content instead")
+        elif kind in ("pdf",):
+            frames = parse_pdf(p)
+        elif kind in ("jpg", "jpeg", "png", "tiff"):
+            frames = parse_image(p)
+        else:
+            raise McpError(f"Unsupported file type: {kind}. Use ingest_csv_data for CSV content.")
+
+        total_added = 0
+        normalized_frames: list[pd.DataFrame] = []
+
+        for idx, fr in enumerate(frames, start=1):
+            if fr is None or fr.empty:
+                continue
+            norm = normalize_dataframe(fr, subject_id=subject_id, source_path=str(p), source_page=idx if kind == "pdf" else None)
+            # Add hadm_id if provided
+            if hadm_id is not None:
+                norm["hadm_id"] = hadm_id
+            added = _insert_rows(norm)
+            total_added += added
+            normalized_frames.append(norm)
+
+        preview = []
+        if normalized_frames:
+            sample = pd.concat(normalized_frames, ignore_index=True).head(5)
+            preview = sample.fillna("").to_dict(orient="records")
+
+        return {"rows_added": int(total_added), "frames_parsed": len(frames), "preview": preview}
+
+    @mcp.tool()
+    async def list_subjects(limit: int = 100) -> list[str]:
+        """List known subjects/patient identifiers present in the local store."""
+        with _connect() as con:
+            cur = con.execute("SELECT DISTINCT subject_id FROM labs WHERE subject_id IS NOT NULL LIMIT ?", (limit,))
+            return [r[0] for r in cur.fetchall() if r[0] is not None]
+
+    @mcp.tool()
+    async def lab_trends(subject_id: str, label_filter: Optional[str] = None, days: Optional[int] = None) -> dict:
+        """Return longitudinal lab values for a subject (optionally filtered by label and lookback days).
+
+        Returns JSON: {label: [{charttime, valuenum, ref_low, ref_high, valueuom}], ...}
+        """
+        params: list[Any] = [subject_id]
+        where = "WHERE subject_id = ? AND valuenum IS NOT NULL"
+        if label_filter:
+            where += " AND label LIKE ?"
+            params.append(f"%{label_filter}%")
+        if days:
+            where += " AND julianday('now') - julianday(charttime) <= ?"
+            params.append(days)
+        sql = f"SELECT label, charttime, valuenum, ref_low, ref_high, valueuom FROM labs {where} ORDER BY label, charttime"
+        with _connect() as con:
+            cur = con.execute(sql, params)
+            rows = cur.fetchall()
+        result: dict[str, list[dict[str, Any]]] = {}
+        for label, charttime, valuenum, rl, rh, uom in rows:
+            result.setdefault(label or "(unknown)", []).append({
+                "charttime": charttime,
+                "valuenum": valuenum,
+                "ref_low": rl,
+                "ref_high": rh,
+                "valueuom": uom,
+            })
+        return result
+
+    @mcp.tool()
+    async def running_summary(subject_id: str, top_k: int = 10, min_points: int = 3) -> dict:
+        """Summarize improvement/decline across all labs for a subject.
+
+        Method:
+          - compute normalized distance to reference midpoint per observation
+          - compare early vs late windows + slope per label
+        Returns dict with improvements, declines, still_abnormal, overview stats.
+        """
+        with _connect() as con:
+            cur = con.execute(
+                """
+                SELECT label, charttime, valuenum, ref_low, ref_high, valueuom
+                FROM labs
+                WHERE subject_id = ? AND valuenum IS NOT NULL
+                ORDER BY label, charttime
+                """,
+                (subject_id,),
+            )
+            rows = cur.fetchall()
+
+        # Group by label
+        by_label: dict[str, list[tuple[datetime, float, Optional[float], Optional[float], str]]] = {}
+        for label, charttime, valuenum, rl, rh, uom in rows:
+            try:
+                dt = pd.to_datetime(charttime).to_pydatetime()
+            except Exception:
+                continue
+            by_label.setdefault(label or "(unknown)", []).append((dt, float(valuenum), rl, rh, uom))
+
+        insights = []
+        for label, obs in by_label.items():
+            if len(obs) < min_points:
+                continue
+            obs.sort(key=lambda x: x[0])
+            times = [o[0] for o in obs]
+            vals = [o[1] for o in obs]
+            lows = [o[2] for o in obs]
+            highs = [o[3] for o in obs]
+            uom = obs[-1][4]
+
+            # distances to mid
+            dists = [
+                _distance_to_mid(v, lo, hi) if (lo is not None and hi is not None) else None
+                for v, lo, hi in zip(vals, lows, highs)
+            ]
+            # window averages (first 25% vs last 25%)
+            q = max(1, len(vals) // 4)
+            early = [d for d in dists[:q] if d is not None]
+            late = [d for d in dists[-q:] if d is not None]
+            delta = None
+            if early and late:
+                delta = float(np.nanmean(late) - np.nanmean(early))  # <0 improvement
+
+            slope = _trend_score(times, vals)
+
+            # abnormality at endpoints
+            def _abn(v, lo, hi):
+                if lo is None or hi is None:
+                    return None
+                return v < lo or v > hi
+
+            start_abn = _abn(vals[0], lows[0], highs[0])
+            end_abn = _abn(vals[-1], lows[-1], highs[-1])
+
+            insights.append({
+                "label": label,
+                "n": len(vals),
+                "unit": uom,
+                "start": vals[0],
+                "end": vals[-1],
+                "start_abnormal": start_abn,
+                "end_abnormal": end_abn,
+                "slope_per_day": slope,
+                "delta_mid_distance": delta,
+            })
+
+        # Rank improvements (delta < 0) and declines (delta > 0)
+        improvements = sorted([i for i in insights if i.get("delta_mid_distance") is not None and i["delta_mid_distance"] < 0], key=lambda x: x["delta_mid_distance"])[:top_k]
+        declines = sorted([i for i in insights if i.get("delta_mid_distance") is not None and i["delta_mid_distance"] > 0], key=lambda x: x["delta_mid_distance"], reverse=True)[:top_k]
+        still_abnormal = [i for i in insights if i["end_abnormal"] is True]
+
+        return {
+            "subject_id": subject_id,
+            "num_series": len(insights),
+            "improvements": improvements,
+            "declines": declines,
+            "still_abnormal": sorted(still_abnormal, key=lambda x: (x["end_abnormal"] is True, -x["n"]))[:top_k],
+        }
+
+    @mcp.tool()
+    async def export_report(subject_id: str, label_filter: Optional[str] = None, max_plots: int = 24) -> dict:
+        """Export time-series plots with reference bands and a Markdown summary.
+
+        Returns paths to generated files and a summary string.
+        """
+        # Fetch data
+        params: list[Any] = [subject_id]
+        where = "WHERE subject_id = ? AND valuenum IS NOT NULL"
+        if label_filter:
+            where += " AND label LIKE ?"
+            params.append(f"%{label_filter}%")
+        sql = f"SELECT label, charttime, valuenum, ref_low, ref_high, valueuom FROM labs {where} ORDER BY label, charttime"
+
+        with _connect() as con:
+            cur = con.execute(sql, params)
+            rows = cur.fetchall()
+
+        by_label: dict[str, list[tuple[datetime, float, Optional[float], Optional[float], str]]] = {}
+        for label, charttime, valuenum, rl, rh, uom in rows:
+            try:
+                dt = pd.to_datetime(charttime).to_pydatetime()
+            except Exception:
+                continue
+            by_label.setdefault(label or "(unknown)", []).append((dt, float(valuenum), rl, rh, uom))
+
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_dir = EXPORTS_DIR / f"{subject_id}-{ts}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate plots
+        plot_paths: list[str] = []
+        for i, (label, obs) in enumerate(by_label.items()):
+            if i >= max_plots:
+                break
+            obs.sort(key=lambda x: x[0])
+            times = [o[0] for o in obs]
+            vals = [o[1] for o in obs]
+            lows = [o[2] for o in obs]
+            highs = [o[3] for o in obs]
+            uom = obs[-1][4]
+
+            fig, ax = plt.subplots(figsize=(7, 3.5))
+            ax.plot(times, vals, marker="o", linewidth=1)
+            # reference band
+            if all(lo is not None for lo in lows) and all(hi is not None for hi in highs):
+                lo = np.nanmean([x for x in lows if x is not None])
+                hi = np.nanmean([x for x in highs if x is not None])
+                if lo is not None and hi is not None and hi > lo:
+                    ax.fill_between(times, lo, hi, alpha=0.15)
+            ax.set_title(f"{label}")
+            ax.set_ylabel(uom or "")
+            ax.grid(True, linestyle=":", linewidth=0.5)
+            fig.autofmt_xdate()
+            out_png = out_dir / f"{i:02d}_{re.sub(r'[^A-Za-z0-9_]+', '_', label)[:40]}.png"
+            fig.savefig(out_png, bbox_inches="tight", dpi=144)
+            plt.close(fig)
+            plot_paths.append(str(out_png))
+
+        # Build Markdown summary using running_summary - need to call the local function
+        summary_data = {}
+        try:
+            with _connect() as con:
+                cur = con.execute(
+                    """
+                    SELECT label, charttime, valuenum, ref_low, ref_high, valueuom
+                    FROM labs
+                    WHERE subject_id = ? AND valuenum IS NOT NULL
+                    ORDER BY label, charttime
+                    """,
+                    (subject_id,),
+                )
+                rows = cur.fetchall()
+
+            # Group by label (simplified version for the export)
+            by_label_summary: dict[str, list[tuple[datetime, float, Optional[float], Optional[float], str]]] = {}
+            for label, charttime, valuenum, rl, rh, uom in rows:
+                try:
+                    dt = pd.to_datetime(charttime).to_pydatetime()
+                except Exception:
+                    continue
+                by_label_summary.setdefault(label or "(unknown)", []).append((dt, float(valuenum), rl, rh, uom))
+
+            summary_data = {"improvements": [], "declines": [], "still_abnormal": []}
         except Exception:
-            continue
-        by_label.setdefault(label or "(unknown)", []).append((dt, float(valuenum), rl, rh, uom))
+            summary_data = {"improvements": [], "declines": [], "still_abnormal": []}
 
-    insights = []
-    for label, obs in by_label.items():
-        if len(obs) < min_points:
-            continue
-        obs.sort(key=lambda x: x[0])
-        times = [o[0] for o in obs]
-        vals = [o[1] for o in obs]
-        lows = [o[2] for o in obs]
-        highs = [o[3] for o in obs]
-        uom = obs[-1][4]
-
-        # distances to mid
-        dists = [
-            _distance_to_mid(v, lo, hi) if (lo is not None and hi is not None) else None
-            for v, lo, hi in zip(vals, lows, highs)
+        md_lines = [
+            f"# Lab Report for {subject_id}",
+            "",
+            f"Generated: {datetime.now().isoformat()}",
+            "",
+            "## Plots",
         ]
-        # window averages (first 25% vs last 25%)
-        q = max(1, len(vals) // 4)
-        early = [d for d in dists[:q] if d is not None]
-        late = [d for d in dists[-q:] if d is not None]
-        delta = None
-        if early and late:
-            delta = float(np.nanmean(late) - np.nanmean(early))  # <0 improvement
+        for pth in plot_paths:
+            rel = Path(pth).as_posix()
+            md_lines.append(f"![{Path(pth).name}]({rel})")
 
-        slope = _trend_score(times, vals)
+        report_md = out_dir / "report.md"
+        report_md.write_text("\n".join(md_lines), encoding="utf-8")
 
-        # abnormality at endpoints
-        def _abn(v, lo, hi):
-            if lo is None or hi is None:
-                return None
-            return v < lo or v > hi
+        index_json = out_dir / "index.json"
+        index_json.write_text(json.dumps({"subject_id": subject_id, "plots": plot_paths, "report": str(report_md)}), encoding="utf-8")
 
-        start_abn = _abn(vals[0], lows[0], highs[0])
-        end_abn = _abn(vals[-1], lows[-1], highs[-1])
+        return {"report": str(report_md), "plots": plot_paths, "export_dir": str(out_dir)}
 
-        insights.append({
-            "label": label,
-            "n": len(vals),
-            "unit": uom,
-            "start": vals[0],
-            "end": vals[-1],
-            "start_abnormal": start_abn,
-            "end_abnormal": end_abn,
-            "slope_per_day": slope,
-            "delta_mid_distance": delta,
-        })
+    @mcp.tool()
+    async def clear_data(confirm: bool = False) -> str:
+        """Erase all stored lab rows (DANGEROUS). Requires confirm=True."""
+        if not confirm:
+            raise McpError("Refusing to clear without confirm=True")
+        with _connect() as con:
+            con.execute("DELETE FROM labs")
+        return "All lab data cleared."
 
-    # Rank improvements (delta < 0) and declines (delta > 0)
-    improvements = sorted([i for i in insights if i.get("delta_mid_distance") is not None and i["delta_mid_distance"] < 0], key=lambda x: x["delta_mid_distance"])[:top_k]
-    declines = sorted([i for i in insights if i.get("delta_mid_distance") is not None and i["delta_mid_distance"] > 0], key=lambda x: x["delta_mid_distance"], reverse=True)[:top_k]
-    still_abnormal = [i for i in insights if i["end_abnormal"] is True]
+    @mcp.resource("resource://medlabs/exports/latest")
+    def latest_exports_index() -> str:
+        """Return JSON index of most recent export folder contents."""
+        if not EXPORTS_DIR.exists():
+            return json.dumps({"exports": []})
+        # find most recent directory
+        dirs = [p for p in EXPORTS_DIR.iterdir() if p.is_dir()]
+        if not dirs:
+            return json.dumps({"exports": []})
+        latest = max(dirs, key=lambda p: p.stat().st_mtime)
+        idx = latest / "index.json"
+        if idx.exists():
+            return idx.read_text(encoding="utf-8")
+        # fallback: list images + md
+        payload = {
+            "export_dir": str(latest),
+            "plots": [str(p) for p in latest.glob("*.png")],
+            "report": str(latest / "report.md"),
+        }
+        return json.dumps(payload)
 
-    return {
-        "subject_id": subject_id,
-        "num_series": len(insights),
-        "improvements": improvements,
-        "declines": declines,
-        "still_abnormal": sorted(still_abnormal, key=lambda x: (x["end_abnormal"] is True, -x["n"]))[:top_k],
-    }
-
-
-@mcp.tool()
-async def export_report(subject_id: str, label_filter: Optional[str] = None, max_plots: int = 24) -> dict:
-    """Export time-series plots with reference bands and a Markdown summary.
-
-    Returns paths to generated files and a summary string.
-    """
-    # Fetch data
-    params: list[Any] = [subject_id]
-    where = "WHERE subject_id = ? AND valuenum IS NOT NULL"
-    if label_filter:
-        where += " AND label LIKE ?"
-        params.append(f"%{label_filter}%")
-    sql = f"SELECT label, charttime, valuenum, ref_low, ref_high, valueuom FROM labs {where} ORDER BY label, charttime"
-
-    with _connect() as con:
-        cur = con.execute(sql, params)
-        rows = cur.fetchall()
-
-    by_label: dict[str, list[tuple[datetime, float, Optional[float], Optional[float], str]]] = {}
-    for label, charttime, valuenum, rl, rh, uom in rows:
-        try:
-            dt = pd.to_datetime(charttime).to_pydatetime()
-        except Exception:
-            continue
-        by_label.setdefault(label or "(unknown)", []).append((dt, float(valuenum), rl, rh, uom))
-
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_dir = EXPORTS_DIR / f"{subject_id}-{ts}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Generate plots
-    plot_paths: list[str] = []
-    for i, (label, obs) in enumerate(by_label.items()):
-        if i >= max_plots:
-            break
-        obs.sort(key=lambda x: x[0])
-        times = [o[0] for o in obs]
-        vals = [o[1] for o in obs]
-        lows = [o[2] for o in obs]
-        highs = [o[3] for o in obs]
-        uom = obs[-1][4]
-
-        fig, ax = plt.subplots(figsize=(7, 3.5))
-        ax.plot(times, vals, marker="o", linewidth=1)
-        # reference band
-        if all(lo is not None for lo in lows) and all(hi is not None for hi in highs):
-            lo = np.nanmean([x for x in lows if x is not None])
-            hi = np.nanmean([x for x in highs if x is not None])
-            if lo is not None and hi is not None and hi > lo:
-                ax.fill_between(times, lo, hi, alpha=0.15)
-        ax.set_title(f"{label}")
-        ax.set_ylabel(uom or "")
-        ax.grid(True, linestyle=":", linewidth=0.5)
-        fig.autofmt_xdate()
-        out_png = out_dir / f"{i:02d}_{re.sub(r'[^A-Za-z0-9_]+', '_', label)[:40]}.png"
-        fig.savefig(out_png, bbox_inches="tight", dpi=144)
-        plt.close(fig)
-        plot_paths.append(str(out_png))
-
-    # Build Markdown summary using running_summary
-    summary = await running_summary(subject_id)  # type: ignore[arg-type]
-
-    md_lines = [
-        f"# Lab Report for {subject_id}",
-        "",
-        f"Generated: {datetime.now().isoformat()}",
-        "",
-        "## Improvements",
-    ]
-    for it in summary.get("improvements", [])[:10]:
-        md_lines.append(f"- **{it['label']}** → {it['start']} → {it['end']} {it.get('unit','')} (Δ mid-dist: {it.get('delta_mid_distance'):.3f})")
-    md_lines.append("")
-    md_lines.append("## Declines")
-    for it in summary.get("declines", [])[:10]:
-        md_lines.append(f"- **{it['label']}** → {it['start']} → {it['end']} {it.get('unit','')} (Δ mid-dist: {it.get('delta_mid_distance'):.3f})")
-    md_lines.append("")
-    md_lines.append("## Still Abnormal at Last Measurement")
-    for it in summary.get("still_abnormal", [])[:10]:
-        md_lines.append(f"- **{it['label']}** (last: {it['end']} {it.get('unit','')})")
-    md_lines.append("")
-    md_lines.append("## Plots")
-    for pth in plot_paths:
-        rel = Path(pth).as_posix()
-        md_lines.append(f"![{Path(pth).name}]({rel})")
-
-    report_md = out_dir / "report.md"
-    report_md.write_text("\n".join(md_lines), encoding="utf-8")
-
-    index_json = out_dir / "index.json"
-    index_json.write_text(json.dumps({"subject_id": subject_id, "plots": plot_paths, "report": str(report_md)}), encoding="utf-8")
-
-    return {"report": str(report_md), "plots": plot_paths, "export_dir": str(out_dir)}
+    return mcp
 
 
-@mcp.tool()
-async def clear_data(confirm: bool = False) -> str:
-    """Erase all stored lab rows (DANGEROUS). Requires confirm=True."""
-    if not confirm:
-        raise McpError("Refusing to clear without confirm=True")
-    with _connect() as con:
-        con.execute("DELETE FROM labs")
-    return "All lab data cleared."
+def main():
+    """Main function to start the MCP server."""
+    logger.info("Creating MedLabs MCP server...")
 
+    # Create the MCP server
+    server = create_server()
 
-# ----------------------------------------------------------------------------
-# Resources (serve latest export index for easy retrieval in Claude)
-# ----------------------------------------------------------------------------
+    # Configure and start the server
+    logger.info("Starting MCP server on 0.0.0.0:8000")
+    logger.info("Server will be accessible via SSE transport")
 
-@mcp.resource("resource://medlabs/exports/latest")
-def latest_exports_index() -> str:
-    """Return JSON index of most recent export folder contents."""
-    if not EXPORTS_DIR.exists():
-        return json.dumps({"exports": []})
-    # find most recent directory
-    dirs = [p for p in EXPORTS_DIR.iterdir() if p.is_dir()]
-    if not dirs:
-        return json.dumps({"exports": []})
-    latest = max(dirs, key=lambda p: p.stat().st_mtime)
-    idx = latest / "index.json"
-    if idx.exists():
-        return idx.read_text(encoding="utf-8")
-    # fallback: list images + md
-    payload = {
-        "export_dir": str(latest),
-        "plots": [str(p) for p in latest.glob("*.png")],
-        "report": str(latest / "report.md"),
-    }
-    return json.dumps(payload)
+    try:
+        # Use FastMCP's built-in run method with SSE transport
+        server.run(transport="sse")
+    except KeyboardInterrupt:
+        logger.info("Server stopped by user")
+    except Exception as e:
+        logger.error(f"Server error: {e}")
+        raise
 
-
-# ----------------------------------------------------------------------------
-# Server entrypoint
-# ----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Use stdio transport for Claude Desktop
-    mcp.run(transport="stdio")
+    main()
